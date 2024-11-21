@@ -57,4 +57,7 @@ if __name__ == "__main__":
     Removed MLP weights 
     modified the self attention weights 
     new learnable lambda paramter 
+
+    config changes:
+    heads = d_model / d, where d = head_d   // 16,
 '''
