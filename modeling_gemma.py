@@ -3,7 +3,34 @@ from torch import nn
 from typing import Optional, Tuple, List
 from torch.nn import CrossEntropyLoss
 import math
+import torch.nn.functional as F
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
+try:
+    from apex.normalization import FusedRMSNorm as RMSNorm 
+except ModuleNotFoundError:
+    print("No fused RMSNorm")
+    from .rms_norm import RMSNorm
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, expansion_factor=8/3):
+        super(SwiGLU, self).__init__()
+        hidden_dim = int(expansion_factor * d_model)
+        self.Wg = nn.Linear(d_model, hidden_dim)
+        self.W1 = nn.Linear(d_model, hidden_dim)
+        self.W2 = nn.Linear(hidden_dim, d_model)
+
+    def forward(self, X):
+        # Swish activation: swish(x) = x * sigmoid(x)
+        swish_output = X @ self.Wg.weight.T + self.Wg.bias
+        swish_activated = swish_output * torch.sigmoid(swish_output)
+        
+        # Element-wise multiplication with W1
+        linear_output = X @ self.W1.weight.T + self.W1.bias
+        gated_output = swish_activated * linear_output
+        
+        # Final projection with W2
+        result = gated_output @ self.W2.weight.T + self.W2.bias
+        return result
 
 class KVCache():
 
@@ -210,7 +237,7 @@ class GemmaAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads  # n_rep
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
@@ -227,6 +254,18 @@ class GemmaAttention(nn.Module):
             base=self.rope_theta,
         )
 
+        '''
+            Differential attention 
+        '''
+        depth = layer_idx - 1
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -236,6 +275,7 @@ class GemmaAttention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
+        kv_len = q_len
         # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
         query_states = self.q_proj(hidden_states)
         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
@@ -260,6 +300,32 @@ class GemmaAttention(nn.Module):
         # Repeat the key and values to match the number of heads of the query
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        """
+            Differential attention
+        """
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.nan_to_num(attn_weights)
+        attn_weights += attention_mask   
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
+            attn_weights
+        )
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        
+        attn_weights = attn_weights.view(bsz, self.num_heads, 2, q_len, kv_len)
+        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        
+        attn = torch.matmul(attn_weights, value_states)
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        attn = attn.transpose(1, 2).reshape(bsz, q_len, self.num_heads * 2 * self.head_dim)
+
+        attn = self.out_proj(attn)
+        return attn, attn_weights
+        '''
         # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -287,6 +353,7 @@ class GemmaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
+        '''
 
 class GemmaDecoderLayer(nn.Module):
 
@@ -296,9 +363,10 @@ class GemmaDecoderLayer(nn.Module):
 
         self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
 
-        self.mlp = GemmaMLP(config)
+        # self.mlp = GemmaMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.swiglu_layer = SwiGLU(config.hidden_size)
 
     def forward(
         self,
@@ -318,15 +386,22 @@ class GemmaDecoderLayer(nn.Module):
             position_ids=position_ids,
             kv_cache=kv_cache,
         )
-        # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states = residual + hidden_states
 
         # [Batch_Size, Seq_Len, Hidden_Size]
-        residual = hidden_states
+        hidden_states = residual + hidden_states # (equation 4)
+
         # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        residual = hidden_states # Y^l
         # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states) # LN(Y^l)
+        # [Batch_Size, Seq_Len, Hidden_Size]
+
+        '''
+            Differential attention modification - MLP was replaced with SwiGLU
+        '''
+        # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
+        hidden_states = self.swiglu_layer(hidden_states)
+
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = residual + hidden_states
 

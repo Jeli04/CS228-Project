@@ -1,6 +1,36 @@
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math 
+try:
+    from apex.normalization import FusedRMSNorm as RMSNorm 
+except ModuleNotFoundError:
+    print("No fused RMSNorm")
+    from .rms_norm import RMSNorm
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, expansion_factor=8/3):
+        super(SwiGLU, self).__init__()
+        hidden_dim = int(expansion_factor * d_model)
+        self.Wg = nn.Linear(d_model, hidden_dim)
+        self.W1 = nn.Linear(d_model, hidden_dim)
+        self.W2 = nn.Linear(hidden_dim, d_model)
+
+    def forward(self, X):
+        # Swish activation: swish(x) = x * sigmoid(x)
+        swish_output = X @ self.Wg.weight.T + self.Wg.bias
+        swish_activated = swish_output * torch.sigmoid(swish_output)
+        
+        # Element-wise multiplication with W1
+        linear_output = X @ self.W1.weight.T + self.W1.bias
+        gated_output = swish_activated * linear_output
+        
+        # Final projection with W2
+        result = gated_output @ self.W2.weight.T + self.W2.bias
+        return result
+
 
 class SiglipVisionConfig:
 
@@ -77,7 +107,7 @@ class SiglipVisionEmbeddings(nn.Module):
 class SiglipAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -91,9 +121,21 @@ class SiglipAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
+        '''
+            Differential attention 
+        '''
+        depth = layer_idx - 1 
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         # hidden_states: [Batch_Size, Num_Patches, Embed_Dim]
@@ -110,6 +152,33 @@ class SiglipAttention(nn.Module):
         key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        '''
+            Differential attention modification
+        '''
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.nan_to_num(attn_weights)
+        # attn_weights += attention_mask   
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
+            attn_weights
+        )
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        
+        attn_weights = attn_weights.view(batch_size, self.num_heads, 2, seq_len, seq_len)
+        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        
+        attn = torch.matmul(attn_weights, value_states)
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * 2 * self.head_dim)
+
+        attn = self.out_proj(attn)
+
+        return attn, attn_weights
+        '''
         # Calculate the attention using the formula Q * K^T / sqrt(d_k). attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
         attn_weights = (torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale)
 
@@ -139,6 +208,7 @@ class SiglipAttention(nn.Module):
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights
+        '''
 
 
 class SiglipMLP(nn.Module):
@@ -160,33 +230,43 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
-    def __init__(self, config: SiglipVisionConfig):
+    def __init__(self, config: SiglipVisionConfig, layer_idx: int):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = SiglipAttention(config)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(config)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.self_attn = SiglipAttention(config, layer_idx)
+        # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.rms_norm1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.mlp = SiglipMLP(config)
+        self.swiglu_layer = SwiGLU(config.hidden_size)
+        # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.rms_norm2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     # Ignore copy
     def forward(
         self,
-        hidden_states: torch.Tensor
+        hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         # residual: [Batch_Size, Num_Patches, Embed_Dim]
         residual = hidden_states
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states = self.rms_norm1(hidden_states)
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states, _ = self.self_attn(hidden_states=hidden_states)
+
         # [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states    # (equation 4)
+
         # residual: [Batch_Size, Num_Patches, Embed_Dim] 
         residual = hidden_states
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.rms_norm2(hidden_states)
+        
+        '''
+            Differential attention modification - MLP was replaced with SwiGLU
+        '''
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.swiglu_layer(hidden_states)
+
         # [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = residual + hidden_states
         
@@ -198,7 +278,7 @@ class SiglipEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [SiglipEncoderLayer(config, layer_idx=l) for l in range(config.num_hidden_layers)]
         )
 
     # Ignore copy
