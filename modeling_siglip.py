@@ -7,7 +7,7 @@ try:
     from apex.normalization import FusedRMSNorm as RMSNorm 
 except ModuleNotFoundError:
     print("No fused RMSNorm")
-    from .rms_norm import RMSNorm
+    from rms_norm import RMSNorm
 
 
 class SwiGLU(nn.Module):
@@ -146,12 +146,16 @@ class SiglipAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         # value_states: [Batch_Size, Num_Patches, Embed_Dim]
         value_states = self.v_proj(hidden_states)
+
+        '''
+            Differential attention modification here with shape 
+        '''
         # query_states: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
-        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim).transpose(1, 2)
 
-        key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim).transpose(1, 2)
 
-        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_heads, 2 * self.head_dim).transpose(1, 2)
 
         '''
             Differential attention modification
@@ -163,8 +167,8 @@ class SiglipAttention(nn.Module):
             attn_weights
         )
 
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
         
         attn_weights = attn_weights.view(batch_size, self.num_heads, 2, seq_len, seq_len)

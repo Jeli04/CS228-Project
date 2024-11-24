@@ -9,7 +9,7 @@ try:
     from apex.normalization import FusedRMSNorm as RMSNorm 
 except ModuleNotFoundError:
     print("No fused RMSNorm")
-    from .rms_norm import RMSNorm
+    from rms_norm import RMSNorm
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model, expansion_factor=8/3):
@@ -282,12 +282,16 @@ class GemmaAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         value_states = self.v_proj(hidden_states)
+
+        '''
+            Differential attention modification here with shape 
+        '''
         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, 2 * self.num_heads, self.head_dim).transpose(1, 2)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, 2 * self.num_key_value_heads, self.head_dim).transpose(1, 2)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, 2*self.head_dim).transpose(1, 2)
 
         # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
@@ -311,8 +315,8 @@ class GemmaAttention(nn.Module):
             attn_weights
         )
 
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
         
         attn_weights = attn_weights.view(bsz, self.num_heads, 2, q_len, kv_len)
