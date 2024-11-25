@@ -5,6 +5,8 @@ from torch.nn import CrossEntropyLoss
 import math
 import torch.nn.functional as F
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
+from transformers import PreTrainedModel, PretrainedConfig, GenerationConfig
+from transformers.modeling_outputs import CausalLMOutput
 try:
     from apex.normalization import FusedRMSNorm as RMSNorm 
 except ModuleNotFoundError:
@@ -64,7 +66,8 @@ class KVCache():
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
-class GemmaConfig():
+class GemmaConfig(PretrainedConfig):
+    model_type = "gemma"
 
     def __init__(
         self,
@@ -83,7 +86,7 @@ class GemmaConfig():
         pad_token_id=None,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)  
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -98,7 +101,9 @@ class GemmaConfig():
         self.attention_dropout = attention_dropout
         self.pad_token_id = pad_token_id
 
-class PaliGemmaConfig():
+
+class PaliGemmaConfig(PretrainedConfig):
+    model_type = "paligemma"
 
     def __init__(
         self,
@@ -112,24 +117,18 @@ class PaliGemmaConfig():
         pad_token_id=None,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.ignore_index = ignore_index
         self.image_token_index = image_token_index
         self.vocab_size = vocab_size
         self.projection_dim = projection_dim
         self.hidden_size = hidden_size
-        self.vision_config = vision_config
+        self.vision_config = SiglipVisionConfig(**vision_config)
+        self.text_config = GemmaConfig(**text_config, pad_token_id=pad_token_id)
+        self.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
+        self.vision_config.projection_dim = projection_dim
         self.is_encoder_decoder = False
         self.pad_token_id = pad_token_id
-
-        self.vision_config = SiglipVisionConfig(**vision_config)
-        self.text_config = text_config
-
-        self.text_config = GemmaConfig(**text_config, pad_token_id=pad_token_id)
-        self.vocab_size = self.text_config.vocab_size
-
-        self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
-        self.vision_config.projection_dim = projection_dim
 
 
 class GemmaRMSNorm(nn.Module):
@@ -190,12 +189,14 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension
-    sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension
+def apply_rotary_pos_emb(q, k, cos_q, sin_q, cos_k, sin_k, unsqueeze_dim=1):
+    cos_q = cos_q.unsqueeze(unsqueeze_dim) # Add the head dimension
+    sin_q = sin_q.unsqueeze(unsqueeze_dim) # Add the head dimension
+    cos_k = cos_k.unsqueeze(unsqueeze_dim) # Add the head dimension
+    sin_k = sin_k.unsqueeze(unsqueeze_dim) # Add the head dimension
     # Apply the formula (34) of the Rotary Positional Encoding paper.
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
+    k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
     return q_embed, k_embed
 
 
@@ -249,7 +250,7 @@ class GemmaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         self.rotary_emb = GemmaRotaryEmbedding(
-            self.head_dim,
+            self.head_dim // 2,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
@@ -259,11 +260,11 @@ class GemmaAttention(nn.Module):
         '''
         depth = layer_idx - 1
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.subln = RMSNorm(2 * self.head_dim // 2, eps=1e-5, elementwise_affine=True)
 
 
     def forward(
@@ -284,19 +285,20 @@ class GemmaAttention(nn.Module):
         value_states = self.v_proj(hidden_states)
 
         '''
-            Differential attention modification here with shape 
+            Differential attention modification here with shape and creating rotary embedding based on query and key sepertely
         '''
         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
-        query_states = query_states.view(bsz, q_len, 2 * self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        key_states = key_states.view(bsz, q_len, 2 * self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, 2 * self.num_key_value_heads, self.head_dim // 2).transpose(1, 2)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, 2*self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
-        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
+        # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim // 2]
+        cos_q, sin_q = self.rotary_emb(query_states, position_ids, seq_len=None)
+        cos_k, sin_k = self.rotary_emb(key_states, position_ids, seq_len=None)
         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim], [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_q, sin_q, cos_k, sin_k)
 
         if kv_cache is not None:
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
@@ -325,9 +327,9 @@ class GemmaAttention(nn.Module):
         attn = torch.matmul(attn_weights, value_states)
         attn = self.subln(attn)
         attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(bsz, q_len, self.num_heads * 2 * self.head_dim)
+        attn = attn.transpose(1, 2).reshape(bsz, q_len, self.num_heads * self.head_dim)
 
-        attn = self.out_proj(attn)
+        attn = self.o_proj(attn)
         return attn, attn_weights
         '''
         # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
@@ -478,6 +480,7 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        **kwargs,
     ) -> Tuple:
 
         # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
@@ -501,7 +504,10 @@ class GemmaForCausalLM(nn.Module):
             # Return the updated cache
             return_data["kv_cache"] = kv_cache
 
-        return return_data
+         # Return CausalLMOutput
+        return CausalLMOutput(
+            return_data
+        )
 
 class PaliGemmaMultiModalProjector(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
@@ -513,9 +519,9 @@ class PaliGemmaMultiModalProjector(nn.Module):
         hidden_states = self.linear(image_features)
         return hidden_states
 
-class PaliGemmaForConditionalGeneration(nn.Module):
+class PaliGemmaForConditionalGeneration(PreTrainedModel):
     def __init__(self, config: PaliGemmaConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.vision_tower = SiglipVisionModel(config.vision_config)
         self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
@@ -525,6 +531,15 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self.language_model = language_model
 
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+
+        # Initialize generation_config with default parameters
+        self.generation_config = GenerationConfig(
+            max_length=20,       # Default max_length
+            num_beams=1,         # Default number of beams
+            early_stopping=False # Default early_stopping
+        )
+
+        self.init_weights()
 
     def tie_weights(self):
         return self.language_model.tie_weights()
@@ -603,7 +618,11 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        **kwargs  # Accept additional keyword arguments
     ) -> Tuple:
+        
+        # Handle 'use_cache' if needed
+        use_cache = kwargs.get("use_cache", True)
 
         # Make sure the input is right-padded
         assert torch.all(attention_mask == 1), "The input cannot be padded"
@@ -626,6 +645,27 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
+            **kwargs,           
         )
 
         return outputs
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past=None,
+        attention_mask=None,
+        pixel_values=None,
+        **kwargs
+    ):
+        if past:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+
+        return {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "attention_mask": attention_mask,
+            "kv_cache": past,
+            **kwargs,
+        }
+    

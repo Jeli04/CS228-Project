@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import json
 from processing_paligemma import PaliGemmaProcessor
-from modeling_gemma import KVCache, PaliGemmaForConditionalGeneration
+from modeling_gemma import KVCache, PaliGemmaForConditionalGeneration, PaliGemmaConfig
 # from transformers import PaliGemmaForConditionalGeneration
 from transformers import BitsAndBytesConfig
 from transformers import Trainer
@@ -10,7 +10,8 @@ from peft import get_peft_model, LoraConfig
 from datasets import load_dataset
 from pathlib import Path
 from safetensors.torch import load_file
-from config_utils import PaliGemmaConfig
+#from config_utils import PaliGemmaConfig
+
 
 def initialize_new_layers(model):
     for name, module in model.named_modules():
@@ -72,14 +73,11 @@ def setup(local_weights_path, config):
         r=16,  # Rank of the adaptation matrices
         lora_alpha=32,  # Scaling factor
         target_modules=[
-            "vision_tower.vision_model.encoder.layers.*.self_attn.q_proj",
-            "vision_tower.vision_model.encoder.layers.*.self_attn.k_proj",
-            "vision_tower.vision_model.encoder.layers.*.self_attn.v_proj",
-            "vision_tower.vision_model.encoder.layers.*.self_attn.out_proj",
-            "language_model.model.layers.*.self_attn.q_proj",
-            "language_model.model.layers.*.self_attn.k_proj",
-            "language_model.model.layers.*.self_attn.v_proj",
-            "language_model.model.layers.*.self_attn.o_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "out_proj",
         ],  
         lora_dropout=0.1,
         bias="none",
@@ -94,7 +92,6 @@ def setup(local_weights_path, config):
         if "lora" in name:
             print(f"LoRA parameter: {name}, requires_grad: {param.requires_grad}")
     model.print_trainable_parameters()  
-    exit()
 
     return model
 
@@ -104,7 +101,36 @@ def load_docvqa():
 
 def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
     model = setup(local_weights_path, model_config)
-    print(model)
+
+    from transformers import GenerationConfig
+
+    # Define generation parameters
+    generation_config = GenerationConfig(
+        max_length=10,
+        num_beams=5,
+        early_stopping=True
+    )
+
+    # Example test inputs
+    input_ids = torch.tensor([[1, 2, 3, 4]])  # Example token IDs
+    pixel_values = torch.randn(1, 3, 224, 224)  # Example image inputs
+    attention_mask = torch.ones_like(input_ids)
+
+    # Initialize model
+    model = setup(local_weights_path, model_config)
+
+    # Set the generation_config to the model's generation_config
+    model.generation_config = generation_config
+
+    # Generate text
+    generated_ids = model.generate(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        attention_mask=attention_mask
+    )
+
+    print(generated_ids)
+
     exit()
     trainer = Trainer(
         model=model,
@@ -125,7 +151,7 @@ if __name__ == "__main__":
 
     with open(model_config, "r") as f:
         model_config = json.load(f)
-    model_config = PaliGemmaConfig(model_config)
+    model_config = PaliGemmaConfig(**model_config)
 
     finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args)
 

@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,7 +33,8 @@ class SwiGLU(nn.Module):
         return result
 
 
-class SiglipVisionConfig:
+class SiglipVisionConfig(PretrainedConfig):
+    model_type = "siglip_vision"
 
     def __init__(
         self,
@@ -48,7 +50,7 @@ class SiglipVisionConfig:
         num_image_tokens: int = None,
         **kwargs
     ):
-        super().__init__()
+        super().__init__(**kwargs) 
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -126,11 +128,11 @@ class SiglipAttention(nn.Module):
         '''
         depth = layer_idx - 1 
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.subln = RMSNorm(2 * self.head_dim // 2, eps=1e-5, elementwise_affine=True)
 
 
     def forward(
@@ -151,11 +153,11 @@ class SiglipAttention(nn.Module):
             Differential attention modification here with shape 
         '''
         # query_states: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
-        query_states = query_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
 
-        key_states = key_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
 
-        value_states = value_states.view(batch_size, seq_len, self.num_heads, 2 * self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         '''
             Differential attention modification
@@ -177,7 +179,7 @@ class SiglipAttention(nn.Module):
         attn = torch.matmul(attn_weights, value_states)
         attn = self.subln(attn)
         attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * 2 * self.head_dim)
+        attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * self.head_dim)
 
         attn = self.out_proj(attn)
 
