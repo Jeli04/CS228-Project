@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import json
-from processing_paligemma import PaliGemmaProcessor
+# from processing_paligemma import PaliGemmaProcessor
 from modeling_gemma import KVCache, PaliGemmaForConditionalGeneration, PaliGemmaConfig
 # from transformers import PaliGemmaForConditionalGeneration
 from transformers import BitsAndBytesConfig, Trainer, TrainingArguments, GenerationConfig, AutoTokenizer
@@ -10,6 +10,7 @@ from datasets import load_dataset
 from pathlib import Path
 from safetensors.torch import load_file
 #from config_utils import PaliGemmaConfig
+from transformers import PaliGemmaProcessor
 
 device = "cuda"
 
@@ -21,7 +22,12 @@ def initialize_new_layers(model):
                 nn.init.zeros_(module.bias)
 
 def setup(local_weights_path, config):
-    model = PaliGemmaForConditionalGeneration(config)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
+    model = PaliGemmaForConditionalGeneration(config, bnb_config)
 
     # load huggingface weights 
     state_dict = {}
@@ -64,11 +70,6 @@ def setup(local_weights_path, config):
         model.config.tie_word_embeddings = False  # or True, based on your needs
 
     # Setup LORA config
-    bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_type=torch.bfloat16
-    )
     lora_config = LoraConfig(
         r=16,  # Rank of the adaptation matrices
         lora_alpha=32,  # Scaling factor
@@ -84,14 +85,13 @@ def setup(local_weights_path, config):
         task_type="CAUSAL_LM"  # Adjust based on your task
     )
     # Inspect module names
-    for name, module in model.named_modules():
-        print(name)
-
+    # for name, module in model.named_modules():
+    #     print(name)
 
     model = get_peft_model(model, lora_config)
-    for name, param in model.named_parameters():
-        if "lora" in name:
-            print(f"LoRA parameter: {name}, requires_grad: {param.requires_grad}")
+    # for name, param in model.named_parameters():
+    #     if "lora" in name:
+    #         print(f"LoRA parameter: {name}, requires_grad: {param.requires_grad}")
     model.print_trainable_parameters()  
 
     return model
@@ -107,7 +107,6 @@ def load_vqav2():
 
     split_ds = ds.train_test_split(test_size=0.05) # we'll use a very small split for demo
     train_ds = split_ds["test"]
-
     return train_ds
     
 def vqav2_collate_fn(examples): # dictionary of images and text
@@ -118,30 +117,48 @@ def vqav2_collate_fn(examples): # dictionary of images and text
                         return_tensors="pt", padding="longest",
                         tokenize_newline_separately=False)
 
-    for values, keys in tokens.items():
-        if type(values) == str:
-            print(keys)
-        if type(values) != str:
-            values = values.to(torch.bfloat16).to(device)
+    for keys, values in tokens.items():
+        values = values.to(torch.bfloat16).to(device)
     return tokens
 
-def generate():
+def generate(prompt: str, local_weights_path, lora_weights_path, model_config, tokenizer, processor):
+    """
+    Generate a response based on a given prompt using the local weights and LoRA weights.
+
+    Args:
+        prompt (str): The input prompt.
+        local_weights_path (str): Path to the local model weights.
+        lora_weights_path (str): Path to the LoRA adapter weights.
+        model_config (PaliGemmaConfig): Model configuration.
+        tokenizer (AutoTokenizer): Tokenizer for the model.
+        processor (PaliGemmaProcessor): Processor for images and text.
+
+    Returns:
+        str: The generated response.
+    """
     # Define generation parameters
     generation_config = GenerationConfig(
-        max_length=10,
-        num_beams=5,
-        early_stopping=True
+        max_length=50,  # Maximum length of the generated text
+        num_beams=5,  # Number of beams for beam search
+        early_stopping=True  # Stop early if all beams converge
     )
 
-    # Example test inputs
-    input_ids = torch.tensor([[1, 2, 3, 4]])  # Example token IDs
-    pixel_values = torch.randn(1, 3, 224, 224)  # Example image inputs
-    attention_mask = torch.ones_like(input_ids)
+    # Tokenize the input prompt
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-    # Initialize model
+    # Dummy image input
+    pixel_values = torch.randn(1, 3, 224, 224).to(device)  # Replace with actual images if required
+    attention_mask = torch.ones_like(input_ids).to(device)
+
+    # Initialize the model
     model = setup(local_weights_path, model_config)
+    model = model.to(device)
 
-    # Set the generation_config to the model's generation_config
+    # Load the LoRA weights
+    lora_state_dict = load_file(lora_weights_path)
+    model.load_state_dict(lora_state_dict, strict=False)
+
+    # Set the generation configuration
     model.generation_config = generation_config
 
     # Generate text
@@ -150,6 +167,11 @@ def generate():
         pixel_values=pixel_values,
         attention_mask=attention_mask
     )
+
+    # Decode the generated text
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+    return generated_text
 
 def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
     model = setup(local_weights_path, model_config)
@@ -180,7 +202,7 @@ if __name__ == "__main__":
     training_args = TrainingArguments(
             num_train_epochs=2,
             remove_unused_columns=False,
-            per_device_train_batch_size=4,
+            per_device_train_batch_size=3,
             gradient_accumulation_steps=4,
             warmup_steps=2,
             learning_rate=2e-5,
@@ -213,7 +235,9 @@ if __name__ == "__main__":
     num_image_tokens = model_config.vision_config.num_image_tokens
     image_size = model_config.vision_config.image_size
     tokenizer = load_tokenizer(local_weights_path)
-    processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
+    # processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
+    processor = PaliGemmaProcessor.from_pretrained("google/paligemma-3b-pt-224")
+    image_token = processor.tokenizer.convert_tokens_to_ids("<image>")
     finetune_lora(local_weights_path, model_config, train_ds, vqav2_collate_fn, training_args)
 
 

@@ -5,7 +5,7 @@ from torch.nn import CrossEntropyLoss
 import math
 import torch.nn.functional as F
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
-from transformers import PreTrainedModel, PretrainedConfig, GenerationConfig
+from transformers import PreTrainedModel, PretrainedConfig, GenerationConfig, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutput
 from dataclasses import dataclass, field
 
@@ -445,7 +445,7 @@ class GemmaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        **kwargs,
+        # **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
         kv_len = q_len
@@ -609,6 +609,7 @@ class GemmaModel(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        # **kwargs,
     ) -> torch.FloatTensor:
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = inputs_embeds
@@ -651,7 +652,7 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        **kwargs,
+        # **kwargs,
     ) -> CausalLMOutput:
 
         # Forward pass through the base model
@@ -660,7 +661,7 @@ class GemmaForCausalLM(nn.Module):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
-            **kwargs,
+            # **kwargs,
         )
 
         # Compute logits
@@ -691,9 +692,10 @@ class PaliGemmaMultiModalProjector(nn.Module):
         return hidden_states
 
 class PaliGemmaForConditionalGeneration(PreTrainedModel):
-    def __init__(self, config: PaliGemmaConfig):
+    def __init__(self, config: PaliGemmaConfig, bnb_config: Optional[BitsAndBytesConfig] = None):
         super().__init__(config)
         self.config = config
+        self.bnb_config = bnb_config  # Store the bnb_config
         self.vision_tower = SiglipVisionModel(config.vision_config)
         self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
         self.vocab_size = config.vocab_size
@@ -709,6 +711,8 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
             num_beams=1,         # Default number of beams
             early_stopping=False # Default early_stopping
         )
+        
+        self.loss_f = torch.nn.CrossEntropyLoss(ignore_index=-100)  # -100 is the ignore token
 
         self.init_weights()
 
@@ -789,56 +793,58 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        labels: Optional[torch.Tensor] = None,
         **kwargs  # Accept additional keyword arguments
     ) -> CausalLMOutput:
-        
-        # Handle 'use_cache' if needed
-        use_cache = kwargs.get("use_cache", True)
 
-        # Make sure the input is right-padded
-        assert torch.all(attention_mask == 1), "The input cannot be padded"
+        # Log input shapes
+        # print(f"Input IDs shape: {input_ids.shape}")
+        # print(f"Attention mask shape: {attention_mask.shape}")
 
         # 1. Extract the input embeddings
-        # shape: (Batch_Size, Seq_Len, Hidden_Size)
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+        
+        # If bnb_config is provided, use its compute type for precision
+        if self.bnb_config and self.bnb_config.bnb_4bit_compute_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=self.bnb_config.bnb_4bit_compute_dtype)
 
-        # 2. Merge text and images
-        # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
-        selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
-        # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Hidden_Size]
+        # 2. Process vision tower for image features
+        # Convert pixel_values to match precision if bnb_config is provided
+        if self.bnb_config and self.bnb_config.bnb_4bit_compute_dtype:
+            pixel_values = pixel_values.to(dtype=self.bnb_config.bnb_4bit_compute_dtype)
+        
+        selected_image_feature = self.vision_tower(pixel_values)
         image_features = self.multi_modal_projector(selected_image_feature)
 
-        # Merge the embeddings of the text tokens and the image tokens
+        # 3. Merge text and image embeddings
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids, attention_mask, kv_cache
         )
-        
-        # Forward pass through the language model, passing 'use_cache' and any other kwargs
+
+        # 4. Forward pass through the language model
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
-            **kwargs,           
+            # **kwargs,
         )
 
-        return outputs
+        # 5. Compute loss if labels are provided
+        loss = None
+        if labels is not None:
+            # Shift logits and labels for causal language modeling
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = self.loss_f(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    
+        # 6. Adjust output precision if bnb_config is provided
+        if self.bnb_config and self.bnb_config.bnb_4bit_compute_dtype:
+            outputs.logits = outputs.logits.to(dtype=self.bnb_config.bnb_4bit_compute_dtype)
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past=None,
-        attention_mask=None,
-        pixel_values=None,
-        **kwargs
-    ):
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        return {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "attention_mask": attention_mask,
-            "kv_cache": past,
-            **kwargs,
-        }
+        return CausalLMOutput(
+            loss=loss,
+            logits=outputs.logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
