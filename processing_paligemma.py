@@ -104,11 +104,15 @@ class PaliGemmaProcessor:
         self,
         text: List[str],
         images: List[Image.Image],
+        suffix: List[str] = None,
+        return_tensors="pt",
         padding: str = "longest",
         truncation: bool = True,
+        tokenize_newline_separately: bool = False,
     ) -> dict:
-        assert len(images) == 1 and len(text) == 1, f"Received {len(images)} images for {len(text)} prompts."
+        assert len(images) == len(text), f"Number of images ({len(images)}) must match number of text prompts ({len(text)})."
 
+        # Preprocess images
         pixel_values = process_images(
             images,
             size=(self.image_size, self.image_size),
@@ -122,25 +126,34 @@ class PaliGemmaProcessor:
         # Convert the numpy array to a PyTorch tensor
         pixel_values = torch.tensor(pixel_values)
 
-        # Prepend a `self.image_seq_length` number of image tokens to the prompt
-        input_strings = [
-            add_image_tokens_to_prompt(
+        # Preprocess text prompts
+        input_strings = []
+        for idx, prompt in enumerate(text):
+            # Prepend image tokens
+            prompt_with_image_tokens = add_image_tokens_to_prompt(
                 prefix_prompt=prompt,
                 bos_token=self.tokenizer.bos_token,
                 image_seq_len=self.image_seq_length,
                 image_token=self.IMAGE_TOKEN,
             )
-            for prompt in text
-        ]
+            # Append suffix (answer choices) if provided
+            if suffix:
+                suffix_text = suffix[idx]
+                if tokenize_newline_separately:
+                    suffix_text = suffix_text.replace("\n", self.tokenizer.eos_token)
+                input_strings.append(f"{prompt_with_image_tokens} {suffix_text}")
+            else:
+                input_strings.append(prompt_with_image_tokens)
 
-        # Returns the input_ids and attention_mask as PyTorch tensors
+        # Tokenize input strings
         inputs = self.tokenizer(
             input_strings,
-            return_tensors="pt",
+            return_tensors=return_tensors,
             padding=padding,
             truncation=truncation,
         )
 
+        # Combine processed images and text inputs
         return_data = {"pixel_values": pixel_values, **inputs}
 
         return return_data

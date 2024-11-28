@@ -4,14 +4,14 @@ import json
 from processing_paligemma import PaliGemmaProcessor
 from modeling_gemma import KVCache, PaliGemmaForConditionalGeneration, PaliGemmaConfig
 # from transformers import PaliGemmaForConditionalGeneration
-from transformers import BitsAndBytesConfig
-from transformers import Trainer
+from transformers import BitsAndBytesConfig, Trainer, TrainingArguments, GenerationConfig, AutoTokenizer
 from peft import get_peft_model, LoraConfig
 from datasets import load_dataset
 from pathlib import Path
 from safetensors.torch import load_file
 #from config_utils import PaliGemmaConfig
 
+device = "cuda"
 
 def initialize_new_layers(model):
     for name, module in model.named_modules():
@@ -87,6 +87,7 @@ def setup(local_weights_path, config):
     for name, module in model.named_modules():
         print(name)
 
+
     model = get_peft_model(model, lora_config)
     for name, param in model.named_parameters():
         if "lora" in name:
@@ -99,11 +100,32 @@ def load_docvqa():
     ds = load_dataset("lmms-lab/DocVQA", "InfographicVQA", split="test")
     print(ds)
 
-def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
-    model = setup(local_weights_path, model_config)
+def load_vqav2():
+    ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:10%]")
+    cols_remove = ["question_type", "answers", "answer_type", "image_id", "question_id"]
+    ds = ds.remove_columns(cols_remove)
 
-    from transformers import GenerationConfig
+    split_ds = ds.train_test_split(test_size=0.05) # we'll use a very small split for demo
+    train_ds = split_ds["test"]
 
+    return train_ds
+    
+def vqav2_collate_fn(examples): # dictionary of images and text
+    texts = ["answer " + example["question"] for example in examples]
+    labels= [example['multiple_choice_answer'] for example in examples]
+    images = [example["image"].convert("RGB") for example in examples]
+    tokens = processor(text=texts, images=images, suffix=labels,
+                        return_tensors="pt", padding="longest",
+                        tokenize_newline_separately=False)
+
+    for values, keys in tokens.items():
+        if type(values) == str:
+            print(keys)
+        if type(values) != str:
+            values = values.to(torch.bfloat16).to(device)
+    return tokens
+
+def generate():
     # Define generation parameters
     generation_config = GenerationConfig(
         max_length=10,
@@ -129,33 +151,71 @@ def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, traini
         attention_mask=attention_mask
     )
 
-    print(generated_ids)
+def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
+    model = setup(local_weights_path, model_config)
 
-    exit()
     trainer = Trainer(
         model=model,
         train_dataset=train_ds ,
         data_collator=collate_fn,
         args=training_args
         )
+    # if hasattr(model.config, "get"):
+    #     delattr(model.config, "get")
 
+    print("Begin Finetuning")
     trainer.train()
+
+def load_tokenizer(model_path):
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
+    assert tokenizer.padding_side == "right"
+    return tokenizer
 
 if __name__ == "__main__":
     # Specify the local path to the model weights
-    local_weights_path = "/home/jerryli/CS228-Project/paligemma-3b-pt-224"
-    model_config = "/home/jerryli/CS228-Project/paligemma-3b-pt-224/config.json"
-    train_ds =None
-    collate_fn = None
-    training_args = {}
+    root = "/home/jerryli/CS228-Project/paligemma-3b-pt-224/models--google--paligemma-3b-pt-224/snapshots/"
+    local_weights_path = root + "35e4f46485b4d07967e7e9935bc3786aad50687c"
+    model_config_path = root + "35e4f46485b4d07967e7e9935bc3786aad50687c" + "/config.json"
+    training_args = TrainingArguments(
+            num_train_epochs=2,
+            remove_unused_columns=False,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=4,
+            warmup_steps=2,
+            learning_rate=2e-5,
+            weight_decay=1e-6,
+            adam_beta2=0.999,
+            logging_steps=100,
+            optim="adamw_hf",
+            save_strategy="steps",
+            save_steps=1000,
+            push_to_hub=True,
+            save_total_limit=1,
+            output_dir="paligemma_vqav2",
+            bf16=True,
+            report_to=["tensorboard"],
+            dataloader_pin_memory=False
+        )
 
-    with open(model_config, "r") as f:
-        model_config = json.load(f)
-    model_config = PaliGemmaConfig(**model_config)
+    # load the config
+    with open(model_config_path, "r") as f:
+        model_config_json = json.load(f)
 
-    finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args)
+    # model_config = PaliGemmaConfig(**model_config_json)
+    # model_config.copy()
+    model_config = PaliGemmaConfig()
 
-    # load_docvqa()
+    # load the dataset
+    train_ds = load_vqav2()
+
+    # finetune 
+    num_image_tokens = model_config.vision_config.num_image_tokens
+    image_size = model_config.vision_config.image_size
+    tokenizer = load_tokenizer(local_weights_path)
+    processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
+    finetune_lora(local_weights_path, model_config, train_ds, vqav2_collate_fn, training_args)
+
 
 
 '''
