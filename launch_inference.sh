@@ -1,6 +1,7 @@
 #!/bin/bash
 
-MODEL_PATH="./paligemma-3b-pt-224/"
+# MODEL_PATH="./paligemma-3b-pt-224/"
+MODEL_PATH="./paligemma_vqav2/checkpoint-740"
 PROMPT="this character is "
 IMAGE_FILE_PATH="./images/spongebob.jpeg"
 MAX_TOKENS_TO_GENERATE=100

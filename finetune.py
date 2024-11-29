@@ -11,6 +11,8 @@ from pathlib import Path
 from safetensors.torch import load_file
 #from config_utils import PaliGemmaConfig
 from transformers import PaliGemmaProcessor
+import os
+from datetime import datetime
 
 device = "cuda"
 
@@ -101,16 +103,20 @@ def load_docvqa():
     print(ds)
 
 def load_vqav2():
-    ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:10%]")
+    ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:100%]")
     cols_remove = ["question_type", "answers", "answer_type", "image_id", "question_id"]
     ds = ds.remove_columns(cols_remove)
 
-    split_ds = ds.train_test_split(test_size=0.05) # we'll use a very small split for demo
+    split_ds = ds.train_test_split(test_size=0.10) # we'll use a very small split for demo
     train_ds = split_ds["test"]
     return train_ds
     
 def vqav2_collate_fn(examples): # dictionary of images and text
-    texts = ["answer " + example["question"] for example in examples]
+    # only supports single image for now, if we want multple multple image_token
+    texts = [
+        f"{' '.join([str(image_token)])} {bos_token} answer {example['question']}"
+        for example in examples
+    ]
     labels= [example['multiple_choice_answer'] for example in examples]
     images = [example["image"].convert("RGB") for example in examples]
     tokens = processor(text=texts, images=images, suffix=labels,
@@ -174,19 +180,43 @@ def generate(prompt: str, local_weights_path, lora_weights_path, model_config, t
     return generated_text
 
 def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
+    # intialize the model and freeze/unfreeze weights
     model = setup(local_weights_path, model_config)
 
+    # intialize the trainer
     trainer = Trainer(
         model=model,
         train_dataset=train_ds ,
         data_collator=collate_fn,
         args=training_args
         )
-    # if hasattr(model.config, "get"):
-    #     delattr(model.config, "get")
-
+    
+    # train
     print("Begin Finetuning")
     trainer.train()
+
+    # save weights
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base_folder = os.path.dirname("/home/jerryli/CS228-Project/paligemma_vqav2/finetuned_weights")  # Parent folder of local weights path
+    save_folder = os.path.join(base_folder, f"finetuned_paligemma_{timestamp}")
+    os.makedirs(save_folder, exist_ok=True)
+
+    model.save_pretrained(save_folder)
+    print(f"Fine-tuned model saved to: {save_folder}")
+
+    # Save the model config
+    config_path = os.path.join(save_folder, "model_config.json")
+    with open(config_path, "w") as config_file:
+        json.dump(model_config.to_dict(), config_file, indent=4)
+    print(f"Model configuration saved to: {config_path}")
+
+    # Save the training arguments
+    train_args_path = os.path.join(save_folder, "training_args.json")
+    training_args_dict = training_args.to_dict()
+    with open(train_args_path, "w") as train_args_file:
+        json.dump(training_args_dict, train_args_file, indent=4)
+    print(f"Training arguments saved to: {train_args_path}")
+
 
 def load_tokenizer(model_path):
     # Load the tokenizer
@@ -200,16 +230,16 @@ if __name__ == "__main__":
     local_weights_path = root + "35e4f46485b4d07967e7e9935bc3786aad50687c"
     model_config_path = root + "35e4f46485b4d07967e7e9935bc3786aad50687c" + "/config.json"
     training_args = TrainingArguments(
-            num_train_epochs=2,
+            num_train_epochs=6,
             remove_unused_columns=False,
             per_device_train_batch_size=3,
-            gradient_accumulation_steps=4,
-            warmup_steps=2,
-            learning_rate=2e-5,
-            weight_decay=1e-6,
+            gradient_accumulation_steps=16,
+            warmup_steps=16,
+            learning_rate=2e-4, # 2e-5
+            weight_decay=1e-8, # more aggresive 
             adam_beta2=0.999,
             logging_steps=100,
-            optim="adamw_hf",
+            optim="adamw_hf",  
             save_strategy="steps",
             save_steps=1000,
             push_to_hub=True,
@@ -238,6 +268,7 @@ if __name__ == "__main__":
     # processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
     processor = PaliGemmaProcessor.from_pretrained("google/paligemma-3b-pt-224")
     image_token = processor.tokenizer.convert_tokens_to_ids("<image>")
+    bos_token = processor.tokenizer.convert_tokens_to_ids("<bos>")
     finetune_lora(local_weights_path, model_config, train_ds, vqav2_collate_fn, training_args)
 
 
