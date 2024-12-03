@@ -3,9 +3,10 @@ from datasets import load_dataset, load_from_disk
 from transformers import PaliGemmaProcessor, PaliGemmaForConditionalGeneration, BitsAndBytesConfig, TrainingArguments, Trainer
 import torch
 from peft import get_peft_model, LoraConfig
+from datetime import datetime
 
 # 1. Load Dataset
-ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:10%]")
+ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:5%]")
 cols_remove = ["question_type", "answers", "answer_type", "image_id", "question_id"]
 ds = ds.remove_columns(cols_remove)
 split_ds = ds.train_test_split(test_size=0.05)
@@ -52,12 +53,13 @@ def collate_fn(examples):
                        return_tensors="pt", padding="longest",
                        tokenize_newline_separately=False)
     tokens = tokens.to(torch.bfloat16).to(device)
+
     return tokens
 
 args = TrainingArguments(
     num_train_epochs=2,
     remove_unused_columns=False,
-    per_device_train_batch_size=2,
+    per_device_train_batch_size=1,
     gradient_accumulation_steps=8,
     warmup_steps=2,
     learning_rate=2e-5,
@@ -83,4 +85,12 @@ trainer = Trainer(
 
 trainer.train()
 
+# save weights
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+base_folder = os.path.dirname("/home/jerryli/CS228-Project/paligemma_vqav2/finetuned_weights")  # Parent folder of local weights path
+save_folder = os.path.join(base_folder, f"finetuned_paligemma_original_{timestamp}")
+os.makedirs(save_folder, exist_ok=True)
+
+model.save_pretrained(save_folder)
+print(f"Fine-tuned model saved to: {save_folder}")
 

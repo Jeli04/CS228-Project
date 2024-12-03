@@ -398,6 +398,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
 class GemmaAttention(nn.Module):
 
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
@@ -541,10 +542,10 @@ class GemmaDecoderLayer(nn.Module):
 
         self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
 
-        # self.mlp = GemmaMLP(config)
+        self.mlp = GemmaMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.swiglu_layer = SwiGLU(config.hidden_size)
+        # self.swiglu_layer = SwiGLU(config.hidden_size)
 
     def forward(
         self,
@@ -578,7 +579,8 @@ class GemmaDecoderLayer(nn.Module):
             Differential attention modification - MLP was replaced with SwiGLU
         '''
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.swiglu_layer(hidden_states)
+        # hidden_states = self.swiglu_layer(hidden_states)
+        hidden_states = self.mlp(hidden_states)
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = residual + hidden_states

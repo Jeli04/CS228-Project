@@ -322,7 +322,7 @@ class SiglipEncoderLayer(nn.Module):
         self.self_attn = SiglipAttention(config, layer_idx)
         # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.rms_norm1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.mlp = SiglipMLP(config)
+        self.mlp = SiglipMLP(config)
         self.swiglu_layer = SwiGLU(config.hidden_size)
         # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.rms_norm2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -351,7 +351,8 @@ class SiglipEncoderLayer(nn.Module):
             Differential attention modification - MLP was replaced with SwiGLU
         '''
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.swiglu_layer(hidden_states)
+        # hidden_states = self.swiglu_layer(hidden_states)
+        hidden_states = self.mlp(hidden_states)
 
         # [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = residual + hidden_states

@@ -73,8 +73,8 @@ def setup(local_weights_path, config):
 
     # Setup LORA config
     lora_config = LoraConfig(
-        r=16,  # Rank of the adaptation matrices
-        lora_alpha=32,  # Scaling factor
+        r=32,  # Rank of the adaptation matrices
+        lora_alpha=64,  # Scaling factor
         target_modules=[
             "q_proj",
             "k_proj",
@@ -86,14 +86,14 @@ def setup(local_weights_path, config):
         bias="none",
         task_type="CAUSAL_LM"  # Adjust based on your task
     )
-    # Inspect module names
-    # for name, module in model.named_modules():
-    #     print(name)
+    # Print parameters 
+    for name, module in model.named_modules():
+        print(name)
 
     model = get_peft_model(model, lora_config)
-    # for name, param in model.named_parameters():
-    #     if "lora" in name:
-    #         print(f"LoRA parameter: {name}, requires_grad: {param.requires_grad}")
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            print(f"LoRA parameter: {name}, requires_grad: {param.requires_grad}")
     model.print_trainable_parameters()  
 
     return model
@@ -103,90 +103,33 @@ def load_docvqa():
     print(ds)
 
 def load_vqav2():
-    ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:100%]")
-    cols_remove = ["question_type", "answers", "answer_type", "image_id", "question_id"]
-    ds = ds.remove_columns(cols_remove)
+    dataset = load_dataset('HuggingFaceM4/VQAv2', split="train[:3%]")
+    dataset = dataset.remove_columns(["question_type", "answers", "answer_type", "image_id", "question_id"])
+    split_ds = dataset.train_test_split(test_size=0.10)
+    return split_ds["train"], split_ds["test"]
 
-    split_ds = ds.train_test_split(test_size=0.10) # we'll use a very small split for demo
-    train_ds = split_ds["test"]
-    return train_ds
-    
-def vqav2_collate_fn(examples): # dictionary of images and text
-    # only supports single image for now, if we want multple multple image_token
-    texts = [
-        f"{' '.join([str(image_token)])} {bos_token} answer {example['question']}"
-        for example in examples
-    ]
-    labels= [example['multiple_choice_answer'] for example in examples]
-    images = [example["image"].convert("RGB") for example in examples]
+def vqav2_collate_fn(batch): # dictionary of images and text
+    texts = ["answer " + sequence["question"] for sequence in batch]
+    labels= [sequence['multiple_choice_answer'] for sequence in batch]
+    images = [sequence["image"].convert("RGB") for sequence in batch]
     tokens = processor(text=texts, images=images, suffix=labels,
                         return_tensors="pt", padding="longest",
                         tokenize_newline_separately=False)
 
     for keys, values in tokens.items():
-        values = values.to(torch.bfloat16).to(device)
+        values = values.to(torch.bfloat16).to(device)    
     return tokens
 
-def generate(prompt: str, local_weights_path, lora_weights_path, model_config, tokenizer, processor):
-    """
-    Generate a response based on a given prompt using the local weights and LoRA weights.
 
-    Args:
-        prompt (str): The input prompt.
-        local_weights_path (str): Path to the local model weights.
-        lora_weights_path (str): Path to the LoRA adapter weights.
-        model_config (PaliGemmaConfig): Model configuration.
-        tokenizer (AutoTokenizer): Tokenizer for the model.
-        processor (PaliGemmaProcessor): Processor for images and text.
-
-    Returns:
-        str: The generated response.
-    """
-    # Define generation parameters
-    generation_config = GenerationConfig(
-        max_length=50,  # Maximum length of the generated text
-        num_beams=5,  # Number of beams for beam search
-        early_stopping=True  # Stop early if all beams converge
-    )
-
-    # Tokenize the input prompt
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-    # Dummy image input
-    pixel_values = torch.randn(1, 3, 224, 224).to(device)  # Replace with actual images if required
-    attention_mask = torch.ones_like(input_ids).to(device)
-
-    # Initialize the model
-    model = setup(local_weights_path, model_config)
-    model = model.to(device)
-
-    # Load the LoRA weights
-    lora_state_dict = load_file(lora_weights_path)
-    model.load_state_dict(lora_state_dict, strict=False)
-
-    # Set the generation configuration
-    model.generation_config = generation_config
-
-    # Generate text
-    generated_ids = model.generate(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        attention_mask=attention_mask
-    )
-
-    # Decode the generated text
-    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-    return generated_text
-
-def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
+def finetune_lora(local_weights_path, model_config, train_ds, eval_ds, collate_fn, training_args):
     # intialize the model and freeze/unfreeze weights
     model = setup(local_weights_path, model_config)
 
     # intialize the trainer
     trainer = Trainer(
         model=model,
-        train_dataset=train_ds ,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds, 
         data_collator=collate_fn,
         args=training_args
         )
@@ -230,18 +173,20 @@ if __name__ == "__main__":
     local_weights_path = root + "35e4f46485b4d07967e7e9935bc3786aad50687c"
     model_config_path = root + "35e4f46485b4d07967e7e9935bc3786aad50687c" + "/config.json"
     training_args = TrainingArguments(
-            num_train_epochs=6,
+            num_train_epochs=3,
             remove_unused_columns=False,
-            per_device_train_batch_size=3,
-            gradient_accumulation_steps=16,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
             warmup_steps=16,
-            learning_rate=2e-4, # 2e-5
-            weight_decay=1e-8, # more aggresive 
+            learning_rate= 2e-4, # <-- based on the constant rule # 2e-4, # 2e-5
+            weight_decay= 1e-8, # 1e-8, # more aggresive 
             adam_beta2=0.999,
             logging_steps=100,
+            evaluation_strategy="steps", 
+            eval_steps=500, 
             optim="adamw_hf",  
             save_strategy="steps",
-            save_steps=1000,
+            save_steps=250, # 1000
             push_to_hub=True,
             save_total_limit=1,
             output_dir="paligemma_vqav2",
@@ -254,22 +199,20 @@ if __name__ == "__main__":
     with open(model_config_path, "r") as f:
         model_config_json = json.load(f)
 
-    # model_config = PaliGemmaConfig(**model_config_json)
-    # model_config.copy()
+
     model_config = PaliGemmaConfig()
 
     # load the dataset
-    train_ds = load_vqav2()
+    train_ds, eval_ds = load_vqav2()
 
     # finetune 
     num_image_tokens = model_config.vision_config.num_image_tokens
     image_size = model_config.vision_config.image_size
     tokenizer = load_tokenizer(local_weights_path)
-    # processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
     processor = PaliGemmaProcessor.from_pretrained("google/paligemma-3b-pt-224")
     image_token = processor.tokenizer.convert_tokens_to_ids("<image>")
     bos_token = processor.tokenizer.convert_tokens_to_ids("<bos>")
-    finetune_lora(local_weights_path, model_config, train_ds, vqav2_collate_fn, training_args)
+    finetune_lora(local_weights_path, model_config, train_ds, eval_ds, vqav2_collate_fn, training_args)
 
 
 
