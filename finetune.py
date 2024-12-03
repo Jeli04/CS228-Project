@@ -4,13 +4,12 @@ import json
 from processing_paligemma import PaliGemmaProcessor
 from modeling_gemma import KVCache, PaliGemmaForConditionalGeneration, PaliGemmaConfig
 # from transformers import PaliGemmaForConditionalGeneration
-from transformers import BitsAndBytesConfig
-from transformers import Trainer
+from transformers import BitsAndBytesConfig, Trainer, GenerationConfig
 from peft import get_peft_model, LoraConfig
 from datasets import load_dataset
 from pathlib import Path
 from safetensors.torch import load_file
-#from config_utils import PaliGemmaConfig
+from datasets import load_dataset
 
 
 def initialize_new_layers(model):
@@ -99,11 +98,7 @@ def load_docvqa():
     ds = load_dataset("lmms-lab/DocVQA", "InfographicVQA", split="test")
     print(ds)
 
-def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
-    model = setup(local_weights_path, model_config)
-
-    from transformers import GenerationConfig
-
+def generate(model, generation_config):
     # Define generation parameters
     generation_config = GenerationConfig(
         max_length=10,
@@ -116,9 +111,6 @@ def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, traini
     pixel_values = torch.randn(1, 3, 224, 224)  # Example image inputs
     attention_mask = torch.ones_like(input_ids)
 
-    # Initialize model
-    model = setup(local_weights_path, model_config)
-
     # Set the generation_config to the model's generation_config
     model.generation_config = generation_config
 
@@ -129,9 +121,9 @@ def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, traini
         attention_mask=attention_mask
     )
 
-    print(generated_ids)
+def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args):
+    model = setup(local_weights_path, model_config)
 
-    exit()
     trainer = Trainer(
         model=model,
         train_dataset=train_ds ,
@@ -141,6 +133,14 @@ def finetune_lora(local_weights_path, model_config, train_ds, collate_fn, traini
 
     trainer.train()
 
+def prepare_vqav2():
+    ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:10%]")
+
+    cols_remove = ["question_type", "answers", "answer_type", "image_id", "question_id"]
+    ds = ds.remove_columns(cols_remove)
+
+
+
 if __name__ == "__main__":
     # Specify the local path to the model weights
     local_weights_path = "/home/jerryli/CS228-Project/paligemma-3b-pt-224"
@@ -149,9 +149,14 @@ if __name__ == "__main__":
     collate_fn = None
     training_args = {}
 
+    # Load the model config
     with open(model_config, "r") as f:
         model_config = json.load(f)
     model_config = PaliGemmaConfig(**model_config)
+
+    # Load the training dataset
+    train_ds = load_dataset('HuggingFaceM4/VQAv2', split="train[:10%]")
+    exit()
 
     finetune_lora(local_weights_path, model_config, train_ds, collate_fn, training_args)
 
