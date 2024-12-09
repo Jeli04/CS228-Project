@@ -58,20 +58,6 @@ def load_finetuned_model(base_model_name, adapter_path, new_weights_path=None):
     return model_with_adapter, processor
 
 def generate_text(model, tokenizer, input_text, max_length=50, num_beams=3, temperature=1.0):
-    """
-    Generates text from the fine-tuned PaliGemma model.
-
-    Args:
-    - model: The fine-tuned PaliGemma model.
-    - tokenizer: The tokenizer for the model.
-    - input_text (str): The input text for generation.
-    - max_length (int): The maximum length of the generated text.
-    - num_beams (int): The number of beams for beam search (for better diversity).
-    - temperature (float): Sampling temperature (higher = more random).
-
-    Returns:
-    - generated_text (str): The generated text.
-    """
     # Tokenize the input text and move to the appropriate device
     inputs = processor(prompt, raw_image.convert("RGB"), return_tensors="pt").to(model.device)
 
