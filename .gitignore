@@ -1,5 +1,9 @@
-/paligemma-3b-pt-224
-/__pycache__
+paligemma-3b-pt-224/
+__pycache__/
 test.py
 VQAv2
 my_project_folder
+paligemma_vqav2/
+images/
+evaluation/dataset/
+test.py

@@ -5,8 +5,10 @@ from torch.nn import CrossEntropyLoss
 import math
 import torch.nn.functional as F
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
-from transformers import PreTrainedModel, PretrainedConfig, GenerationConfig
+from transformers import PreTrainedModel, PretrainedConfig, GenerationConfig, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutput
+from dataclasses import dataclass, field
+
 try:
     from apex.normalization import FusedRMSNorm as RMSNorm 
 except ModuleNotFoundError:
@@ -66,6 +68,7 @@ class KVCache():
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
+'''
 class GemmaConfig(PretrainedConfig):
     model_type = "gemma"
 
@@ -86,7 +89,7 @@ class GemmaConfig(PretrainedConfig):
         pad_token_id=None,
         **kwargs,
     ):
-        super().__init__(**kwargs)  
+        super().__init__(**kwargs) 
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -105,10 +108,47 @@ class GemmaConfig(PretrainedConfig):
 class PaliGemmaConfig(PretrainedConfig):
     model_type = "paligemma"
 
+        # WERID BUG WITH PRETRAINED CONFIG WHERE AFTER FIRST INTIALIZATION AND YOU CALL THE PALIGEMMACONFIG AGAIN IT 
+        # TRIES TO REINTIIALIZE BUT WITH THE DEFAULT PARAMETERS WHICH IS NONE 
+
+        # TEMP FIX IS TO JUST FEED THE CONFIG MANUALLY 
+
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
+        vision_config={
+            "hidden_size": 2048,
+            "intermediate_size": 16384,
+            "model_type": "gemma",
+            "num_attention_heads": 8,
+            "num_hidden_layers": 18,
+            "num_image_tokens": 256,
+            "num_key_value_heads": 1,
+            "torch_dtype": "float32",
+            "vocab_size": 257216,
+            "rms_norm_eps": 1e-6,
+            "layer_norm_eps": 1e-6,
+            "head_dim": 256,
+            "max_position_embeddings": 512,
+            "rope_theta": 10000,
+            "attention_bias": False 
+        },
+        text_config={
+            "hidden_size": 2048,
+            "intermediate_size": 16384,
+            "model_type": "gemma",
+            "num_attention_heads": 8,
+            "num_hidden_layers": 18,
+            "num_image_tokens": 256,
+            "num_key_value_heads": 1,
+            "torch_dtype": "float32",
+            "vocab_size": 257216,
+            "rms_norm_eps": 1e-6,
+            "layer_norm_eps": 1e-6,
+            "head_dim": 256,
+            "max_position_embeddings": 512,
+            "rope_theta": 10000,
+            "attention_bias": False 
+        },
         ignore_index=-100,
         image_token_index=256000,
         vocab_size=257152,
@@ -123,12 +163,144 @@ class PaliGemmaConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.projection_dim = projection_dim
         self.hidden_size = hidden_size
+        print(hidden_size)
         self.vision_config = SiglipVisionConfig(**vision_config)
+        print(text_config)
         self.text_config = GemmaConfig(**text_config, pad_token_id=pad_token_id)
         self.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
         self.vision_config.projection_dim = projection_dim
         self.is_encoder_decoder = False
         self.pad_token_id = pad_token_id
+'''
+
+class GemmaConfig(PretrainedConfig):
+    model_type = "gemma"
+
+    def __init__(
+        self,
+        vocab_size=257216,
+        hidden_size=2048,
+        intermediate_size=16384,
+        num_hidden_layers=18,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+        head_dim=256,
+        max_position_embeddings=512,
+        rope_theta=10000,
+        attention_bias=False,
+        torch_dtype="float32",
+        layer_norm_eps=1e-6,
+        rms_norm_eps=1e-6,
+        attention_dropout = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
+        self.attention_bias = attention_bias
+        self.torch_dtype = torch_dtype
+        self.layer_norm_eps = layer_norm_eps
+        self.rms_norm_eps = rms_norm_eps
+        self.attention_dropout = attention_dropout
+    
+    def to_dict(self):
+        """Convert configuration to a dictionary."""
+        output = super().to_dict()
+        output.update({
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.head_dim,
+            "max_position_embeddings": self.max_position_embeddings,
+            "rope_theta": self.rope_theta,
+            "attention_bias": self.attention_bias,
+            "torch_dtype": self.torch_dtype,
+            "layer_norm_eps": self.layer_norm_eps,
+            "rms_norm_eps": self.rms_norm_eps,
+            "pad_token_id": self.pad_token_id,
+            "attention_dropout": self.attention_dropout
+        })
+        return output
+
+    @classmethod
+    def from_dict(cls, config_dict):
+        """Instantiate GemmaConfig from a dictionary."""
+        return cls(
+            vocab_size=config_dict.get("vocab_size", 257216),
+            hidden_size=config_dict.get("hidden_size", 2048),
+            intermediate_size=config_dict.get("intermediate_size", 16384),
+            num_hidden_layers=config_dict.get("num_hidden_layers", 18),
+            num_attention_heads=config_dict.get("num_attention_heads", 8),
+            num_key_value_heads=config_dict.get("num_key_value_heads", 1),
+            head_dim=config_dict.get("head_dim", 256),
+            max_position_embeddings=config_dict.get("max_position_embeddings", 512),
+            rope_theta=config_dict.get("rope_theta", 10000),
+            attention_bias=config_dict.get("attention_bias", False),
+            torch_dtype=config_dict.get("torch_dtype", "float32"),
+            layer_norm_eps=config_dict.get("layer_norm_eps", 1e-6),
+            rms_norm_eps=config_dict.get("rms_norm_eps", 1e-6),
+            pad_token_id=config_dict.get("pad_token_id", 0),
+            attention_dropout=config_dict.get("attention_dropout", True),
+            **config_dict
+        )
+
+@dataclass
+class PaliGemmaConfig(PretrainedConfig):
+    model_type: str = field(default="paligemma")
+    vision_config: SiglipVisionConfig = field(default_factory=SiglipVisionConfig)
+    text_config: GemmaConfig = field(default_factory=GemmaConfig)
+    ignore_index: int = -100
+    image_token_index: int = 256000
+    vocab_size: int = 257152
+    projection_dim: int = 2048
+    hidden_size: int = 2048
+    pad_token_id: int = 0
+    is_encoder_decoder: bool = field(default=False)
+
+    def __post_init__(self):
+        super().__init__()
+
+        # If vision_config is a dict, convert it to SiglipVisionConfig
+        if isinstance(self.vision_config, dict):
+            self.vision_config = SiglipVisionConfig(**self.vision_config)
+
+        # If text_config is a dict, convert it to GemmaConfig
+        if isinstance(self.text_config, dict):
+            self.text_config = GemmaConfig(**self.text_config)
+
+        # Compute additional attributes
+        self.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
+        self.vision_config.projection_dim = self.projection_dim
+
+    def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary."""
+        output = super().to_dict()
+        output["vision_config"] = self.vision_config.to_dict() if isinstance(self.vision_config, SiglipVisionConfig) else self.vision_config
+        output["text_config"] = self.text_config.to_dict() if isinstance(self.text_config, GemmaConfig) else self.text_config
+        return output
+
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> "PaliGemmaConfig":
+        """Instantiate PaliGemmaConfig from a dictionary."""
+        vision_config = config_dict.pop("vision_config", {})
+        text_config = config_dict.pop("text_config", {})
+
+        return cls(
+            vision_config=SiglipVisionConfig.from_dict(vision_config) if isinstance(vision_config, dict) else vision_config,
+            text_config=GemmaConfig.from_dict(text_config) if isinstance(text_config, dict) else text_config,
+            **config_dict
+        )
+
 
 
 class GemmaRMSNorm(nn.Module):
@@ -226,6 +398,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
 class GemmaAttention(nn.Module):
 
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
@@ -273,7 +446,7 @@ class GemmaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        **kwargs,
+        # **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
         kv_len = q_len
@@ -320,7 +493,7 @@ class GemmaAttention(nn.Module):
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        
+
         attn_weights = attn_weights.view(bsz, self.num_heads, 2, q_len, kv_len)
         attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
         
@@ -369,10 +542,10 @@ class GemmaDecoderLayer(nn.Module):
 
         self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
 
-        # self.mlp = GemmaMLP(config)
+        self.mlp = GemmaMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.swiglu_layer = SwiGLU(config.hidden_size)
+        # self.swiglu_layer = SwiGLU(config.hidden_size)
 
     def forward(
         self,
@@ -406,7 +579,8 @@ class GemmaDecoderLayer(nn.Module):
             Differential attention modification - MLP was replaced with SwiGLU
         '''
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.swiglu_layer(hidden_states)
+        # hidden_states = self.swiglu_layer(hidden_states)
+        hidden_states = self.mlp(hidden_states)
 
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = residual + hidden_states
@@ -437,6 +611,7 @@ class GemmaModel(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
+        # **kwargs,
     ) -> torch.FloatTensor:
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = inputs_embeds
@@ -460,7 +635,6 @@ class GemmaModel(nn.Module):
         return hidden_states
 
 class GemmaForCausalLM(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -480,34 +654,34 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        **kwargs,
-    ) -> Tuple:
+        # **kwargs,
+    ) -> CausalLMOutput:
 
-        # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
-        # outputs: [Batch_Size, Seq_Len, Hidden_Size]
-        outputs = self.model(
+        # Forward pass through the base model
+        hidden_states = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
+            # **kwargs,
         )
 
-        hidden_states = outputs
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        # Compute logits
+        logits = self.lm_head(hidden_states).float()
 
+        # Prepare the output dictionary
         return_data = {
             "logits": logits,
         }
 
+        # Map `kv_cache` to `past_key_values` if cache is used
         if kv_cache is not None:
-            # Return the updated cache
-            return_data["kv_cache"] = kv_cache
+            # Convert KVCache to list of tuples [(k1, v1), (k2, v2), ...]
+            past_key_values = list(zip(kv_cache.key_cache, kv_cache.value_cache))
+            return_data["past_key_values"] = past_key_values
 
-         # Return CausalLMOutput
-        return CausalLMOutput(
-            return_data
-        )
+        # Return as CausalLMOutput with keyword arguments
+        return CausalLMOutput(**return_data)
 
 class PaliGemmaMultiModalProjector(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
@@ -520,9 +694,10 @@ class PaliGemmaMultiModalProjector(nn.Module):
         return hidden_states
 
 class PaliGemmaForConditionalGeneration(PreTrainedModel):
-    def __init__(self, config: PaliGemmaConfig):
+    def __init__(self, config: PaliGemmaConfig, bnb_config: Optional[BitsAndBytesConfig] = None):
         super().__init__(config)
         self.config = config
+        self.bnb_config = bnb_config  # Store the bnb_config
         self.vision_tower = SiglipVisionModel(config.vision_config)
         self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
         self.vocab_size = config.vocab_size
@@ -538,6 +713,8 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
             num_beams=1,         # Default number of beams
             early_stopping=False # Default early_stopping
         )
+        
+        self.loss_f = torch.nn.CrossEntropyLoss(ignore_index=-100)  # -100 is the ignore token
 
         self.init_weights()
 
@@ -618,54 +795,58 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        labels: Optional[torch.Tensor] = None,
         **kwargs  # Accept additional keyword arguments
-    ) -> Tuple:
-        
-        # Handle 'use_cache' if needed
-        use_cache = kwargs.get("use_cache", True)
+    ) -> CausalLMOutput:
 
-        # Make sure the input is right-padded
-        assert torch.all(attention_mask == 1), "The input cannot be padded"
+        # Log input shapes
+        # print(f"Input IDs shape: {input_ids.shape}")
+        # print(f"Attention mask shape: {attention_mask.shape}")
 
-        # 1. Extra the input embeddings
-        # shape: (Batch_Size, Seq_Len, Hidden_Size)
+        # 1. Extract the input embeddings
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+        
+        # If bnb_config is provided, use its compute type for precision
+        if self.bnb_config and self.bnb_config.bnb_4bit_compute_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=self.bnb_config.bnb_4bit_compute_dtype)
 
-        # 2. Merge text and images
-        # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
-        selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
-        # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Hidden_Size]
+        # 2. Process vision tower for image features
+        # Convert pixel_values to match precision if bnb_config is provided
+        if self.bnb_config and self.bnb_config.bnb_4bit_compute_dtype:
+            pixel_values = pixel_values.to(dtype=self.bnb_config.bnb_4bit_compute_dtype)
+        
+        selected_image_feature = self.vision_tower(pixel_values)
         image_features = self.multi_modal_projector(selected_image_feature)
 
-        # Merge the embeddings of the text tokens and the image tokens
-        inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
-        
+        # 3. Merge text and image embeddings
+        inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(
+            image_features, inputs_embeds, input_ids, attention_mask, kv_cache
+        )
+
+        # 4. Forward pass through the language model
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
-            **kwargs,           
+            # **kwargs,
         )
 
-        return outputs
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past=None,
-        attention_mask=None,
-        pixel_values=None,
-        **kwargs
-    ):
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        return {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "attention_mask": attention_mask,
-            "kv_cache": past,
-            **kwargs,
-        }
+        # 5. Compute loss if labels are provided
+        loss = None
+        if labels is not None:
+            # Shift logits and labels for causal language modeling
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = self.loss_f(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
     
+        # 6. Adjust output precision if bnb_config is provided
+        if self.bnb_config and self.bnb_config.bnb_4bit_compute_dtype:
+            outputs.logits = outputs.logits.to(dtype=self.bnb_config.bnb_4bit_compute_dtype)
+
+        return CausalLMOutput(
+            loss=loss,
+            logits=outputs.logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )

@@ -32,7 +32,7 @@ class SwiGLU(nn.Module):
         result = gated_output @ self.W2.weight.T + self.W2.bias
         return result
 
-
+'''
 class SiglipVisionConfig(PretrainedConfig):
     model_type = "siglip_vision"
 
@@ -62,7 +62,87 @@ class SiglipVisionConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
         self.num_image_tokens = num_image_tokens
+'''
 
+
+class SiglipVisionConfig(PretrainedConfig):
+    model_type = "siglip_vision_model"
+
+    def __init__(
+        self,
+        hidden_size=1152,
+        intermediate_size=4304,
+        num_hidden_layers=27,
+        num_attention_heads=16,
+        num_image_tokens=256,
+        patch_size=14,
+        projection_dim=2048,
+        projector_hidden_act="gelu_fast",
+        vision_use_head=False,
+        rms_norm_eps=1e-6,
+        layer_norm_eps=1e-6,
+        image_size=224,
+        attention_dropout=0.0,
+        num_channels = 3,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_image_tokens = num_image_tokens
+        self.patch_size = patch_size
+        self.projection_dim = projection_dim
+        self.projector_hidden_act = projector_hidden_act
+        self.vision_use_head = vision_use_head
+        self.rms_norm_eps = rms_norm_eps
+        self.layer_norm_eps = layer_norm_eps
+        self.image_size = image_size
+        self.attention_dropout =attention_dropout
+        self.num_channels = num_channels
+    
+    def to_dict(self):
+        """Convert configuration to a dictionary."""
+        output = super().to_dict()
+        output.update({
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_image_tokens": self.num_image_tokens,
+            "patch_size": self.patch_size,
+            "projection_dim": self.projection_dim,
+            "projector_hidden_act": self.projector_hidden_act,
+            "vision_use_head": self.vision_use_head,
+            "rms_norm_eps": self.rms_norm_eps,
+            "layer_norm_eps": self.layer_norm_eps,
+            "image_size": self.image_size,
+            "attention_dropout": self.attention_dropout,
+            "num_channels": self.num_channels
+        })
+        return output
+
+    @classmethod
+    def from_dict(cls, config_dict):
+        """Instantiate SiglipVisionConfig from a dictionary."""
+        return cls(
+            hidden_size=config_dict.get("hidden_size", 1152),
+            intermediate_size=config_dict.get("intermediate_size", 4304),
+            num_hidden_layers=config_dict.get("num_hidden_layers", 27),
+            num_attention_heads=config_dict.get("num_attention_heads", 16),
+            num_image_tokens=config_dict.get("num_image_tokens", 256),
+            patch_size=config_dict.get("patch_size", 14),
+            projection_dim=config_dict.get("projection_dim", 2048),
+            projector_hidden_act=config_dict.get("projector_hidden_act", "gelu_fast"),
+            vision_use_head=config_dict.get("vision_use_head", False),
+            rms_norm_eps=config_dict.get("rms_norm_eps", 1e-6),
+            layer_norm_eps=config_dict.get("layer_norm_eps", 1e-6),
+            image_size = config_dict.get("image_size", 224),
+            attention_dropout = config_dict.get("attention_dropout", True),
+            num_channels = config_dict.get("num_channels", 3),
+            **config_dict
+        )
 
 class SiglipVisionEmbeddings(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
@@ -242,7 +322,7 @@ class SiglipEncoderLayer(nn.Module):
         self.self_attn = SiglipAttention(config, layer_idx)
         # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.rms_norm1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.mlp = SiglipMLP(config)
+        self.mlp = SiglipMLP(config)
         self.swiglu_layer = SwiGLU(config.hidden_size)
         # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.rms_norm2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -271,7 +351,8 @@ class SiglipEncoderLayer(nn.Module):
             Differential attention modification - MLP was replaced with SwiGLU
         '''
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.swiglu_layer(hidden_states)
+        # hidden_states = self.swiglu_layer(hidden_states)
+        hidden_states = self.mlp(hidden_states)
 
         # [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = residual + hidden_states
