@@ -185,9 +185,9 @@ class SiglipVisionEmbeddings(nn.Module):
         # [Batch_Size, Num_Patches, Embed_Dim]
         return embeddings
 
-
+# Our Proposed Differential Attention 
 class SiglipAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention with Differential Attention v2"""
 
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -195,106 +195,199 @@ class SiglipAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim**-0.5 # Equivalent to 1 / sqrt(self.head_dim)
+        self.scale = self.head_dim**-0.5  # Equivalent to 1 / sqrt(self.head_dim)
         self.dropout = config.attention_dropout
 
+        # Linear layers for projection
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
-        '''
-            Differential attention 
-        '''
-        depth = layer_idx - 1 
+        """
+        Differential Attention Parameters
+        """
+        depth = layer_idx - 1
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0, std=0.1))
         self.subln = RMSNorm(2 * self.head_dim // 2, eps=1e-5, elementwise_affine=True)
-
 
     def forward(
         self,
-        hidden_states: torch.Tensor
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-
-        # hidden_states: [Batch_Size, Num_Patches, Embed_Dim]
+        """Input shape: [Batch_Size, Seq_Len, Embed_Dim]"""
         batch_size, seq_len, _ = hidden_states.size()
-        # query_states: [Batch_Size, Num_Patches, Embed_Dim]
-        query_states = self.q_proj(hidden_states)
-        # key_states: [Batch_Size, Num_Patches, Embed_Dim]
-        key_states = self.k_proj(hidden_states)
-        # value_states: [Batch_Size, Num_Patches, Embed_Dim]
-        value_states = self.v_proj(hidden_states)
 
-        '''
-            Differential attention modification here with shape 
-        '''
-        # query_states: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
+        # Project hidden states into query, key, and value
+        query_states = self.q_proj(hidden_states)  # Shape: [Batch_Size, Seq_Len, Embed_Dim]
+        key_states = self.k_proj(hidden_states)    # Shape: [Batch_Size, Seq_Len, Embed_Dim]
+        value_states = self.v_proj(hidden_states)  # Shape: [Batch_Size, Seq_Len, Embed_Dim]
+
+        """
+        Reshape and transpose for multi-head attention
+        """
         query_states = query_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
-
         key_states = key_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
-
         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        '''
-            Differential attention modification
-        '''
+        """
+        Compute attention weights
+        """
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         attn_weights = torch.nan_to_num(attn_weights)
-        # attn_weights += attention_mask   
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
-            attn_weights
-        )
 
+        if attention_mask is not None:
+            if attention_mask.size() != (batch_size, 1, seq_len, key_states.shape[-2]):
+                raise ValueError(
+                    f"Attention mask should have size {(batch_size, 1, seq_len, key_states.shape[-2])}, but got"
+                    f" {attention_mask.size()}"
+                )
+            attn_weights += attention_mask
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(attn_weights)
+
+        """
+        Apply Differential Attention
+        """
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        
+
         attn_weights = attn_weights.view(batch_size, self.num_heads, 2, seq_len, seq_len)
         attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
-        
-        attn = torch.matmul(attn_weights, value_states)
-        attn = self.subln(attn)
-        attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * self.head_dim)
 
-        attn = self.out_proj(attn)
-
-        return attn, attn_weights
-        '''
-        # Calculate the attention using the formula Q * K^T / sqrt(d_k). attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
-        attn_weights = (torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale)
-
-        if attn_weights.size() != (batch_size, self.num_heads, seq_len, seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(batch_size, self.num_heads, seq_len, seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        # Apply the softmax row-wise. attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # Apply dropout only during training
-        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-        # Multiply the attention weights by the value states. attn_output: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
+        """
+        Compute weighted value states
+        """
         attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = self.subln(attn_output)  # Normalize attention output
+        attn_output = attn_output * (1 - self.lambda_init)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * self.head_dim)
 
-        if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(batch_size, self.num_heads, seq_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-        # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim]
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        # [Batch_Size, Num_Patches, Num_Heads, Head_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
-        # [Batch_Size, Num_Patches, Embed_Dim]
+        """
+        Final output projection
+        """
         attn_output = self.out_proj(attn_output)
+        attn_output = torch.nan_to_num(attn_output, nan=0.0, posinf=1e4, neginf=-1e4)
 
         return attn_output, attn_weights
-        '''
+
+
+# Original Differential Attention
+# class SiglipAttention(nn.Module):
+#     """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+#     def __init__(self, config, layer_idx):
+#         super().__init__()
+#         self.config = config
+#         self.embed_dim = config.hidden_size
+#         self.num_heads = config.num_attention_heads
+#         self.head_dim = self.embed_dim // self.num_heads
+#         self.scale = self.head_dim**-0.5 # Equivalent to 1 / sqrt(self.head_dim)
+#         self.dropout = config.attention_dropout
+
+#         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+#         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+#         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+#         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+#         '''
+#             Differential attention 
+#         '''
+#         depth = layer_idx - 1 
+#         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+#         self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.subln = RMSNorm(2 * self.head_dim // 2, eps=1e-5, elementwise_affine=True)
+
+
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor
+#     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+#         # hidden_states: [Batch_Size, Num_Patches, Embed_Dim]
+#         batch_size, seq_len, _ = hidden_states.size()
+#         # query_states: [Batch_Size, Num_Patches, Embed_Dim]
+#         query_states = self.q_proj(hidden_states)
+#         # key_states: [Batch_Size, Num_Patches, Embed_Dim]
+#         key_states = self.k_proj(hidden_states)
+#         # value_states: [Batch_Size, Num_Patches, Embed_Dim]
+#         value_states = self.v_proj(hidden_states)
+
+#         '''
+#             Differential attention modification here with shape 
+#         '''
+#         # query_states: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
+#         query_states = query_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
+
+#         key_states = key_states.view(batch_size, seq_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
+
+#         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+#         '''
+#             Differential attention modification
+#         '''
+#         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+#         attn_weights = torch.nan_to_num(attn_weights)
+#         # attn_weights += attention_mask   
+#         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
+#             attn_weights
+#         )
+
+#         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
+#         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
+#         lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        
+#         attn_weights = attn_weights.view(batch_size, self.num_heads, 2, seq_len, seq_len)
+#         attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        
+#         attn = torch.matmul(attn_weights, value_states)
+#         attn = self.subln(attn)
+#         attn = attn * (1 - self.lambda_init)
+#         attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+
+#         attn = self.out_proj(attn)
+
+#         return attn, attn_weights
+#         '''
+#         # Calculate the attention using the formula Q * K^T / sqrt(d_k). attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
+#         attn_weights = (torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale)
+
+#         if attn_weights.size() != (batch_size, self.num_heads, seq_len, seq_len):
+#             raise ValueError(
+#                 f"Attention weights should be of size {(batch_size, self.num_heads, seq_len, seq_len)}, but is"
+#                 f" {attn_weights.size()}"
+#             )
+
+#         # Apply the softmax row-wise. attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
+#         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+#         # Apply dropout only during training
+#         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+#         # Multiply the attention weights by the value states. attn_output: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
+#         attn_output = torch.matmul(attn_weights, value_states)
+
+#         if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
+#             raise ValueError(
+#                 f"`attn_output` should be of size {(batch_size, self.num_heads, seq_len, self.head_dim)}, but is"
+#                 f" {attn_output.size()}"
+#             )
+#         # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim]
+#         attn_output = attn_output.transpose(1, 2).contiguous()
+#         # [Batch_Size, Num_Patches, Num_Heads, Head_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
+#         attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
+#         # [Batch_Size, Num_Patches, Embed_Dim]
+#         attn_output = self.out_proj(attn_output)
+
+#         return attn_output, attn_weights
+#         '''
 
 
 class SiglipMLP(nn.Module):

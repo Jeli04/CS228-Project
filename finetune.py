@@ -18,7 +18,6 @@ import os
 from datetime import datetime
 from huggingface_hub import login
 from transformers import TrainerCallback
-import os
 from peft import PeftModel
 import numpy as np 
 import random
@@ -27,7 +26,7 @@ device = "cuda"
 
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 
-
+# Call back for saving the parameters
 class SaveLoRACallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         model = kwargs["model"]
@@ -227,22 +226,16 @@ def resume_finetuning(base_model_path, adapter_dir, new_weights_path, train_ds, 
             'lambda_k1' in name or
             'lambda_q2' in name or
             'lambda_k2'):
+                # hacky solution to set the lambda parameters since resuming will without is random initally
                 print(f"Setting custom values for {name}")
                 param.data = nn.Parameter(torch.empty(512 // 2, dtype=torch.bfloat16, device="cuda").normal_(mean=0.0, std=0.1))  # Example: Set random values
-                print(param.data)
 
     # 3. Load the new lambda_q, lambda_k, and subln weights
     if os.path.isfile(new_weights_path):
         # Load the new parameters
         new_params = torch.load(new_weights_path, map_location="cpu")
 
-        # strip the prefix:
-        # new_params = {k.replace("base_model.model.", "") if "base_model.model." in k else k: v for k, v in new_params.items()}
-
         missing_keys, unexpected_keys = model.load_state_dict(new_params, strict=False)
-        # print("Loaded new parameters from:", new_weights_path)
-        # print("Missing keys:", missing_keys)
-        # print("Unexpected keys:", unexpected_keys)
 
         # Free memory
         del new_params
@@ -281,18 +274,7 @@ def resume_finetuning(base_model_path, adapter_dir, new_weights_path, train_ds, 
         data_collator=resume_collate_fn,
         args=training_args
     )
-
-    # # 4. Resume training from the checkpoint if provided
-    # if resume_checkpoint_path:
-    #     print(f"Resuming from checkpoint: {resume_checkpoint_path}")
-    #     # The Trainer will automatically load optimizer, scheduler, and RNG states from the checkpoint
-    #     trainer.train(resume_from_checkpoint=resume_checkpoint_path)
-    # else:
-    #     # If no checkpoint is available, just continue training from the current state
-    #     trainer.train()
-
     trainer.train()
-
 
     # 5. Save the re-finetuned model
     save_dir = os.path.join(training_args.output_dir, "resumed_finetuned")

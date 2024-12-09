@@ -398,47 +398,55 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-
+# Our Proposed Differential Attention
 class GemmaAttention(nn.Module):
+    """Multi-headed attention with Differential Attention"""
 
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
 
+        # Configuration parameters
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads  # n_rep
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        assert self.hidden_size % self.num_heads == 0            
+        assert self.hidden_size % self.num_heads == 0, (
+            f"hidden_size {self.hidden_size} must be divisible by num_heads {self.num_heads}."
+        )
 
+        # Projection layers
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+        # Rotary embeddings for position encoding
         self.rotary_emb = GemmaRotaryEmbedding(
-            self.head_dim // 2,
+            self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
 
-        '''
-            Differential attention 
-        '''
-        depth = layer_idx - 1
+        # Differential Attention parameters
+        depth = layer_idx - 1 if layer_idx is not None else 0
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.subln = RMSNorm(2 * self.head_dim // 2, eps=1e-5, elementwise_affine=True)
 
+        std = 0.1  # Standard deviation for initialization
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=std))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=std))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=std))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=std))
+
+        # RMSNorm for stability
+        self.subln = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
 
     def forward(
         self,
@@ -446,93 +454,193 @@ class GemmaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         kv_cache: Optional[KVCache] = None,
-        # **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
-        kv_len = q_len
-        # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Prepare query, key, and value states
+        bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
-        # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         key_states = self.k_proj(hidden_states)
-        # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         value_states = self.v_proj(hidden_states)
 
-        '''
-            Differential attention modification here with shape and creating rotary embedding based on query and key sepertely
-        '''
-        # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
-        query_states = query_states.view(bsz, q_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
-        # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        key_states = key_states.view(bsz, q_len, 2 * self.num_key_value_heads, self.head_dim // 2).transpose(1, 2)
-        # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+        # Reshape and prepare rotary embeddings
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim // 2]
         cos_q, sin_q = self.rotary_emb(query_states, position_ids, seq_len=None)
         cos_k, sin_k = self.rotary_emb(key_states, position_ids, seq_len=None)
-        # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim], [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_q, sin_q, cos_k, sin_k)
 
+        # Update cached states if available
         if kv_cache is not None:
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
 
-        # Repeat the key and values to match the number of heads of the query
+        # Expand key/value states to match query heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        """
-            Differential attention
-        """
+        # Compute attention weights
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         attn_weights = torch.nan_to_num(attn_weights)
-        attn_weights += attention_mask   
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
-            attn_weights
-        )
+        if attention_mask is not None:
+            attn_weights += attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(query_states)
 
+        # Differential Attention
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
+        # print(lambda_full)
+        # exit()
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
 
-        attn_weights = attn_weights.view(bsz, self.num_heads, 2, q_len, kv_len)
-        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
-        
-        attn = torch.matmul(attn_weights, value_states)
-        attn = self.subln(attn)
-        attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(bsz, q_len, self.num_heads * self.head_dim)
+        # Reshape and apply lambda adjustment
+        attn_weights = attn_weights.view(bsz, self.num_heads, 1, q_len, -1)
+        attn_weights = attn_weights[:, :, 0] - (lambda_full * attn_weights[:, :, 0])
 
-        attn = self.o_proj(attn)
-        return attn, attn_weights
-        '''
-        # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        assert attention_mask is not None
-        attn_weights = attn_weights + attention_mask
-
-        # Apply the softmax
-        # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # Apply the dropout
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        # Multiply by the values. [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch_Size, Num_Heads_KV, Seq_Len_KV, Head_Dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
+        # Compute attention outputs
         attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = self.subln(attn_output)
+        attn_output = attn_output * (1 - self.lambda_init)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.num_heads * self.head_dim)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-        # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim]
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
-        attn_output = attn_output.view(bsz, q_len, -1)
-        # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
+        # Final projection
         attn_output = self.o_proj(attn_output)
-
         return attn_output, attn_weights
-        '''
+
+# Original Differential Attention
+# class GemmaAttention(nn.Module):
+
+#     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+#         super().__init__()
+#         self.config = config
+#         self.layer_idx = layer_idx
+
+#         self.attention_dropout = config.attention_dropout
+#         self.hidden_size = config.hidden_size
+#         self.num_heads = config.num_attention_heads
+#         self.head_dim = config.head_dim
+#         self.num_key_value_heads = config.num_key_value_heads
+#         self.num_key_value_groups = self.num_heads // self.num_key_value_heads  # n_rep
+#         self.max_position_embeddings = config.max_position_embeddings
+#         self.rope_theta = config.rope_theta
+#         self.is_causal = True
+
+#         assert self.hidden_size % self.num_heads == 0            
+
+#         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+#         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+#         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+#         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+#         self.rotary_emb = GemmaRotaryEmbedding(
+#             self.head_dim // 2,
+#             max_position_embeddings=self.max_position_embeddings,
+#             base=self.rope_theta,
+#         )
+
+#         '''
+#             Differential attention 
+#         '''
+#         depth = layer_idx - 1
+#         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+#         self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim // 2, dtype=torch.float32).normal_(mean=0,std=0.1))
+#         self.subln = RMSNorm(2 * self.head_dim // 2, eps=1e-5, elementwise_affine=True)
+
+
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         attention_mask: Optional[torch.Tensor] = None,
+#         position_ids: Optional[torch.LongTensor] = None,
+#         kv_cache: Optional[KVCache] = None,
+#         # **kwargs,
+#     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+#         bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
+#         kv_len = q_len
+#         # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
+#         query_states = self.q_proj(hidden_states)
+#         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
+#         key_states = self.k_proj(hidden_states)
+#         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
+#         value_states = self.v_proj(hidden_states)
+
+#         '''
+#             Differential attention modification here with shape and creating rotary embedding based on query and key sepertely
+#         '''
+#         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
+#         query_states = query_states.view(bsz, q_len, 2 * self.num_heads, self.head_dim // 2).transpose(1, 2)
+#         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+#         key_states = key_states.view(bsz, q_len, 2 * self.num_key_value_heads, self.head_dim // 2).transpose(1, 2)
+#         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+#         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+#         # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim // 2]
+#         cos_q, sin_q = self.rotary_emb(query_states, position_ids, seq_len=None)
+#         cos_k, sin_k = self.rotary_emb(key_states, position_ids, seq_len=None)
+#         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim], [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+#         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_q, sin_q, cos_k, sin_k)
+
+#         if kv_cache is not None:
+#             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
+
+#         # Repeat the key and values to match the number of heads of the query
+#         key_states = repeat_kv(key_states, self.num_key_value_groups)
+#         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+#         """
+#             Differential attention
+#         """
+#         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+#         attn_weights = torch.nan_to_num(attn_weights)
+#         attn_weights += attention_mask   
+#         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
+#             attn_weights
+#         )
+
+#         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(query_states)
+#         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(query_states)
+#         lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+#         attn_weights = attn_weights.view(bsz, self.num_heads, 2, q_len, kv_len)
+#         attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        
+#         attn = torch.matmul(attn_weights, value_states)
+#         attn = self.subln(attn)
+#         attn = attn * (1 - self.lambda_init)
+#         attn = attn.transpose(1, 2).reshape(bsz, q_len, self.num_heads * self.head_dim)
+
+#         attn = self.o_proj(attn)
+#         return attn, attn_weights
+#         '''
+#         # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+#         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+#         assert attention_mask is not None
+#         attn_weights = attn_weights + attention_mask
+
+#         # Apply the softmax
+#         # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+#         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+#         # Apply the dropout
+#         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+#         # Multiply by the values. [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch_Size, Num_Heads_KV, Seq_Len_KV, Head_Dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
+#         attn_output = torch.matmul(attn_weights, value_states)
+
+#         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+#             raise ValueError(
+#                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+#                 f" {attn_output.size()}"
+#             )
+#         # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim]
+#         attn_output = attn_output.transpose(1, 2).contiguous()
+#         # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
+#         attn_output = attn_output.view(bsz, q_len, -1)
+#         # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
+#         attn_output = self.o_proj(attn_output)
+
+#         return attn_output, attn_weights
+#         '''
 
 class GemmaDecoderLayer(nn.Module):
 
