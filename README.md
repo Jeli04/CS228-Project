@@ -52,18 +52,6 @@ Further information can be found in our report linked above. There are plans to 
    ```bash
    python3 finetune.py
 
-
-## Experiments
-    Our main modifications to the model can be found in modeling_gemma.py and modeling_siglip.py. 
-
-1. **Finetune Original Base Model**  
-   ```bash
-   python3 finetune_original.py
-2. **Finetune Our Model**  
-   ```bash
-   python3 finetune_original.py
-
-
 ## Evaluation
 
 1. **TODO**  
