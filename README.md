@@ -33,6 +33,7 @@ Further information can be found in our report linked above. There are plans to 
 ### ✅ Todo
   - [ ] Reconduct further evaluations
   - [ ] Experiment with Phi3
+  - [ ] Code Cleanup
 
 ## Installation
 
@@ -49,7 +50,7 @@ Further information can be found in our report linked above. There are plans to 
    python3 finetune_original.py
 2. **Finetune Our Model**  
    ```bash
-   python3 finetune_original.py
+   python3 finetune.py
 
 
 ## Experiments
